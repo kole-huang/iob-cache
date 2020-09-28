@@ -22,7 +22,10 @@ module cache_memory
     parameter LINE2MEM_W = WORD_OFF_W-$clog2(BE_DATA_W/FE_DATA_W), //burst offset based on the cache and memory word size
     parameter WTBUF_DEPTH_W = 4,
     //Replacement policy (N_WAYS > 1)
-    parameter REP_POLICY = `LRU //LRU - Least Recently Used (stack/shift); LRU_add (1) - LRU with adders ; BIT_PLRU (2) - bit-based pseudoLRU; TREE_PLRU (3) - tree-based pseudoLRU
+    parameter REP_POLICY = `LRU, //LRU - Least Recently Used (stack/shift); LRU_add (1) - LRU with adders ; BIT_PLRU (2) - bit-based pseudoLRU; TREE_PLRU (3) - tree-based pseudoLRU 
+    // //Controller's options
+    parameter CTRL_CACHE = 0, //Adds a Controller to the cache, to use functions sent by the master or count the hits and misses
+    parameter CTRL_CNT = 1  //Counters for Cache Hits and Misses - Disabling this and previous, the Controller only store the buffer states and allows cache invalidation
     )
    ( 
      input                                      clk,
@@ -143,8 +146,8 @@ module cache_memory
      end
 
    //assign raw = write_hit_prev & (way_hit == way_hit) & (index_prev == index_reg) & (offset_prev == offset);//issue - currently a RAW in different indexes in the way-hit causes the read to read from the write addr.
-   assign raw = write_hit_prev;
-
+  // assign raw = write_hit_prev;
+   assign raw = write_hit_prev & (way_hit == way_hit) & (offset_prev == offset);
 
    
    assign hit = |way_hit & replace_ready & (~raw);//way_hit is also used during line replacement (to update that respective way). Hit is when there is a hit in a way and there isn't occuring a line-replacement (read-miss). 
@@ -157,11 +160,29 @@ module cache_memory
 
    
    //cache-control hit-miss counters enables
-   assign write_hit  = ready & ( hit & write_access_reg);
-   assign write_miss = ready & (~hit & write_access_reg);
-   assign read_hit   = ready & ( hit &  read_access_reg);
-   assign read_miss  = ready & (~hit &  read_access_reg);
+generate 
+   if(CTRL_CACHE & CTRL_CNT)
+     begin
+        //cache-control hit-miss counters enables
+        assign write_hit  = ready & ( hit & write_access_reg);
+        assign write_miss = ready & (~hit & write_access_reg);
+        assign read_hit   = ready & ( hit &  read_access_reg);
+        assign read_miss  = replace_valid;//will also subtract read_hit
+     end
+   else
+     begin
+        assign write_hit  = 1'bx;
+        assign write_miss = 1'bx;
+        assign read_hit   = 1'bx;
+        assign read_miss  = 1'bx;
+     end // else: !if(CACHE_CTRL & CTRL_CNT)
+endgenerate
+
+
    
+   ////////////////////////////////////////
+   //Memories implementation configurations
+   ////////////////////////////////////////    
    genvar                                                   i,j,k;
    generate
       if(N_WAYS > 1)
@@ -242,7 +263,8 @@ module cache_memory
                                    .clk (clk),
                                    .en  (valid), 
                                    .we ({FE_NBYTES{way_hit[k]}} & line_wstrb[(j*(BE_DATA_W/FE_DATA_W)+i)*FE_NBYTES +: FE_NBYTES]),
-                                   .addr((write_access_reg & way_hit[k])? index_reg : index),
+                                  // .addr((write_access_reg & way_hit[k])? index_reg : index),
+                                   .addr((write_access_reg & way_hit[k] & ((j*(BE_DATA_W/FE_DATA_W)+i) == offset))? index_reg : index),
                                    // .data_in ((~replace_ready)? read_rdata[i*FE_DATA_W +: FE_DATA_W] : wdata_reg),
                                    .data_in ((write_access_reg)? wdata_reg : read_rdata[i*FE_DATA_W +: FE_DATA_W]),
                                    .data_out(line_rdata[(k*(2**WORD_OFF_W)+j*(BE_DATA_W/FE_DATA_W)+i)*FE_DATA_W +: FE_DATA_W])
@@ -350,7 +372,7 @@ module cache_memory
                               .clk (clk),
                               .en  (valid), 
                               .we ({FE_NBYTES{way_hit[k]}} & line_wstrb[i*FE_NBYTES +: FE_NBYTES]),
-                              .addr((write_access_reg & way_hit[k])? index_reg : index),
+                              .addr((write_access_reg & way_hit[k] & (i == offset))? index_reg : index),
                               .data_in ((write_access_reg)? wdata_reg : read_rdata[i*FE_DATA_W +: FE_DATA_W]),
                               .data_out(line_rdata[(k*(2**WORD_OFF_W)+i)*FE_DATA_W +: FE_DATA_W])
                               );
@@ -429,7 +451,7 @@ module cache_memory
                               .clk (clk),
                               .en  (valid), 
                               .we ({FE_NBYTES{way_hit}} & line_wstrb[(j*(BE_DATA_W/FE_DATA_W)+i)*FE_NBYTES +: FE_NBYTES]),
-                              .addr((write_access_reg & way_hit)? index_reg : index),
+                              .addr((write_access_reg & way_hit & ((j*(BE_DATA_W/FE_DATA_W)+i) == offset))? index_reg : index),
                               .data_in ((write_access_reg)? wdata_reg : read_rdata[i*FE_DATA_W +: FE_DATA_W]),
                               .data_out(line_rdata[(j*(BE_DATA_W/FE_DATA_W)+i)*FE_DATA_W +: FE_DATA_W])
                               );
@@ -502,7 +524,7 @@ module cache_memory
                          .clk (clk),
                          .en  (valid), 
                          .we ({FE_NBYTES{way_hit}} & line_wstrb[i*FE_NBYTES +: FE_NBYTES]),
-                         .addr((write_access_reg & way_hit)? index_reg : index),
+                         .addr((write_access_reg & way_hit & (i == offset))? index_reg : index),
                          .data_in ((write_access_reg)? wdata_reg : read_rdata[i*FE_DATA_W +: FE_DATA_W]),
                          .data_out(line_rdata[i*FE_DATA_W +: FE_DATA_W])
                          );
