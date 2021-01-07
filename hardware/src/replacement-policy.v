@@ -190,51 +190,68 @@ module replacement_policy
         end
       else // (REP_POLICY == PLRU_tree)
         begin
-           
-           wire [N_WAYS -1: 1] tree_in, tree_out;
-           wire [N_WAYS -1: 0] tree_dec [NWAY_W: 0]; // the order of the way line_addr will be [lower; ...; higher way line_addr], for readable reasons
 
-           // Tree-structure: key_in[i] = tree's bit i (1 - upper half of the section, 0 -lower half)
-           for (i = 1; i <= NWAY_W; i = i + 1)
-	     for (j = 0; j < (1<<(i-1)) ; j = j + 1)
-               begin : tree_encoder
-	          assign tree_in [(1<<(i-1))+j] = (tree_out[(1<<(i-1))+j] && ~(|way_hit[N_WAYS-(2*j*(N_WAYS>>i)) -1: N_WAYS-(2*j+1)*(N_WAYS>>i)])) || (|way_hit[(N_WAYS-(2*j+1)*(N_WAYS>>i)) -1: N_WAYS-(2*j+2)*(N_WAYS>>i)]); // (t-bit * (~|way_hit[upper_section]) + |way_hit[lower_section])
-	       end
-           
-           // Tree's Decoder: using the tree's bits, finds out where they are pointing in the binary tree.
-           assign tree_dec [0] = {N_WAYS{1'b1}}; // the first position of the tree's matrix will be all 1s, for the AND logic of the following algorithm work properlly
-           for (i = 1; i <= NWAY_W; i = i + 1)
-	     for (j = 0; j < (1 << (i-1)); j = j + 1)
-	       for (k = 0; k < (N_WAYS >> i); k = k + 1)
-		 begin : tree_decoder
-	            assign tree_dec [i][j*(N_WAYS >> (i-1)) + k] = tree_dec [i-1][j*(N_WAYS >> (i-1)) + k] && tree_out [(1 << (i-1)) + j]; // the first half will be the Tree's bit (1 equal upper position)
-		    assign tree_dec [i][j*(N_WAYS >> (i-1)) + k + (N_WAYS >> i)] = tree_dec [i-1][j*(N_WAYS >> (i-1)) + k] && ~tree_out [(1 << (i-1)) + j]; //second half of the same Tree's bit (0 equals lower position)      
-		 end
+           wire [N_WAYS-1:1] t_plru, t_plru_output;
+           wire [NWAY_W-1:0] way_hit_bin;
 
+           wire [NWAY_W:0] node_id[NWAY_W:1];
+           assign node_id[1] = t_plru_output[1] ? 3 : 2; // next node id @ level2 to traverse
+           for (i = 2; i <= NWAY_W; i = i + 1) begin : traverse_tree_level
+              // next node id @ level3, level4, ..., to traverse
+              assign node_id[i] = t_plru_output[node_id[i-1]] ? ((node_id[i-1]<<1)+1) : (node_id[i-1]<<1);
+           end
 
-           
-           // placing the way select wire in the correct order for the onehot-binary encoder
-           for (i = 0; i < N_WAYS; i = i + 1)
-	     assign way_select[i] = tree_dec [NWAY_W][N_WAYS - i -1];//the last row of tree_dec has the result of the Tree's encoder
-           
+           // way hit reverse traversal node id list
+           // way_hit_bin+N_WAYS: way idx to node id mapping
+           // update_node_id[i] is the node id that is needed to change its direction bit according to way_hit
+           // update_node_id[i+1] is the child node id of update_node_id[i]
+           // update_node_id[i+1] == (update_node_id[i] << 1) ==> update_node_id[i+1] is the left node of update_node_id[i]
+           // update_node_id[i+1] > (update_node_id[i] << 1)  ==> update_node_id[i+1] is the right node of update_node_id[i]
+           // if update_node_id[i+1] is the left node of update_node_id[i], the direction bit of update_node_id[i] is 1
+           // if update_node_id[i+1] is the right node of update_node_id[i], the direction bit of update_node_id[i] is 0
+           wire [NWAY_W:0] update_node_id[NWAY_W+1:1];
+           wire update_node_id_dir[NWAY_W:1];
+           assign update_node_id[NWAY_W+1] = way_hit_bin+N_WAYS;
+           for (i = NWAY_W; i >= 1; i = i - 1) begin : traverse_update_node
+              assign update_node_id[i] = update_node_id[i + 1] >> 1;
+              assign update_node_id_dir[i] = (update_node_id[i + 1] == update_node_id[i] << 1) ? 1 : 0;
+           end
 
-           //Most Recently Used (MRU) memory	   
+           // tree update for every node
+           for (i = 1; i <= NWAY_W; i = i + 1) begin : update_tree_level
+              for (j = 0; j < (1<<(i-1)); j = j + 1) begin : update_tree_level_node
+                 assign t_plru[(1<<(i-1))+j] = ((|way_hit) && (((1<<(i-1))+j) == update_node_id[i])) ?
+                       update_node_id_dir[i] : t_plru_output[(1<<(i-1))+j];
+              end
+           end
+
+           assign way_select_bin = node_id[NWAY_W]-N_WAYS;
+           assign way_select = (1 << way_select_bin);
+
+           onehot_to_bin #(
+              .BIN_W (NWAY_W)
+           ) way_hit_conv (
+              .onehot(way_hit[N_WAYS-1:1]),
+              .bin   (way_hit_bin)
+           );
+
+           //Most Recently Used (MRU) memory
            iob_reg_file
              #(
                .ADDR_WIDTH (LINE_OFF_W),
                .COL_WIDTH (N_WAYS-1),
                .NUM_COL (1)
-               ) 
+               )
            mru_memory //simply uses the same format as valid memory
              (
-              .clk  (clk      ),
-              .rst  (reset    ),
-              .wdata(tree_in   ),
-              .rdata(tree_out  ),     
-              .addr (line_addr),
-              .en   (write_en )
+              .clk  (clk          ),
+              .rst  (reset        ),
+              .wdata(t_plru       ),
+              .rdata(t_plru_output),
+              .addr (line_addr    ),
+              .en   (write_en     )
               );
-           
+
         end // else: !if(REP_POLICY == PLRU_tree)
    endgenerate
    
